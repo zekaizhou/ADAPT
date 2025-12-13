@@ -45,10 +45,10 @@ def load_clip_to_cpu(cfg):
     except RuntimeError:
         state_dict = torch.load(model_path, map_location="cpu")
     design_details = {"trainer": 'IVLP',
-                      "vision_depth": cfg.TRAINER.DAPL.PROMPT_DEPTH_VISION,
-                      "language_depth": cfg.TRAINER.DAPL.PROMPT_DEPTH_TEXT,
-                      "vision_ctx": cfg.TRAINER.DAPL.N_CTX_VISION,
-                      "language_ctx": cfg.TRAINER.DAPL.N_CTX_TEXT
+                      "vision_depth": cfg.TRAINER.ADAPT.PROMPT_DEPTH_VISION,
+                      "language_depth": cfg.TRAINER.ADAPT.PROMPT_DEPTH_TEXT,
+                      "vision_ctx": cfg.TRAINER.ADAPT.N_CTX_VISION,
+                      "language_ctx": cfg.TRAINER.ADAPT.N_CTX_TEXT
                       }
     model = clip.build_model(state_dict or model.state_dict(), design_details)
 
@@ -81,7 +81,7 @@ class PromptLearner(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         n_cls = len(classnames)
-        n_ctx = cfg.TRAINER.DAPL.N_CTX 
+        n_ctx = cfg.TRAINER.ADAPT.N_CTX 
         dtype = clip_model.dtype  
         ctx_dim = clip_model.ln_final.weight.shape[0]   
         clip_imsize = clip_model.visual.input_resolution
@@ -89,7 +89,7 @@ class PromptLearner(nn.Module):
         domainnames_num = cfg.DATASET.SOURCE_DOMAINS + cfg.DATASET.TARGET_DOMAINS
         domainnames = [", a {} image.".format(domain) for domain in domainnames_num]
         n_dm = len(cfg.DATASET.SOURCE_DOMAINS) + len(cfg.DATASET.TARGET_DOMAINS)  # number of domains
-        n_dmx = cfg.TRAINER.DAPL.N_DMX  # number of domain context
+        n_dmx = cfg.TRAINER.ADAPT.N_DMX  # number of domain context
         n = n_dmx + n_ctx 
         self.n_dm = n_dm
         self.n_dmx = n_dmx
@@ -97,7 +97,7 @@ class PromptLearner(nn.Module):
 
         naive_prompt_prefix = "a photo of a".replace("_", " ")
 
-        if cfg.TRAINER.DAPL.CSC:
+        if cfg.TRAINER.ADAPT.CSC:
             print("Initializing class-specific contexts")
             ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
         else:
@@ -146,7 +146,7 @@ class PromptLearner(nn.Module):
 
         self.n_cls = n_cls
         self.n_ctx = n_ctx
-        self.csc = cfg.TRAINER.DAPL.CSC
+        self.csc = cfg.TRAINER.ADAPT.CSC
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
         self.name_lens = name_lens
         self.naive_embedding = naive_embedding.to(torch.device("cuda"))
@@ -187,6 +187,178 @@ class PromptLearner(nn.Module):
 
         return prompts 
 
+# class PromptLearner(nn.Module):
+#     def __init__(self, cfg, classnames, clip_model):
+#         super().__init__()
+#         n_cls = len(classnames)
+#         n_ctx = cfg.TRAINER.ADAPT.N_CTX
+
+#         dtype = clip_model.dtype
+#         ctx_dim = clip_model.ln_final.weight.shape[0]
+#         clip_imsize = clip_model.visual.input_resolution
+#         cfg_imsize = cfg.INPUT.SIZE[0]
+#         domainnames = cfg.DATASET.SOURCE_DOMAINS + cfg.DATASET.TARGET_DOMAINS
+#         domainnames = [
+#             ", a {} image.".format(domain) for domain in domainnames
+#         ]
+#         n_dm = len(cfg.DATASET.SOURCE_DOMAINS) + len(
+#             cfg.DATASET.TARGET_DOMAINS)  # number of domains
+#         n_dmx = cfg.TRAINER.ADAPT.N_DMX  # number of domain context
+
+#         n_datt=4
+#         d_atts=["style","texture","shape"]
+#         n = n_dmx + n_ctx
+#         self.n_dm = n_dm
+#         self.n_dmx = n_dmx
+#         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
+
+#         naive_prompt_prefix = "a photo of a".replace("_", " ")
+
+#         if cfg.TRAINER.ADAPT.CSC:
+#             print("Initializing class-specific contexts")
+#             ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
+#         else:
+#             print("Initializing a generic context")
+#             ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
+#         nn.init.normal_(ctx_vectors, std=0.02)
+#         print("ctx vectors size: ".format(ctx_vectors.size()))
+#         domain_prefix = " ".join(["X"] * n_datt)+" "+d_atts[0]+" "+" ".join(["X"] * n_datt)+" "+d_atts[1]+" "+" ".join(["X"] * n_datt)+" "+d_atts[2]
+
+#         domain_prefix_len=len(_tokenizer.encode(domain_prefix))
+#         prompt_prefix = domain_prefix+" "+" ".join(["X"] * n)
+
+#         att_vectors_1 = torch.empty(n_dm, n_datt, ctx_dim, dtype=dtype)
+#         att_vectors_2 = torch.empty(n_dm, n_datt, ctx_dim, dtype=dtype)
+#         att_vectors_3 = torch.empty(n_dm, n_datt, ctx_dim, dtype=dtype)
+
+#         nn.init.normal_(att_vectors_1, std=0.01)
+#         nn.init.normal_(att_vectors_2, std=0.01)
+#         nn.init.normal_(att_vectors_3, std=0.01)
+
+#         self.dtx_att1 = nn.Parameter(att_vectors_1)
+#         self.dtx_att2 = nn.Parameter(att_vectors_2)
+#         self.dtx_att3 = nn.Parameter(att_vectors_3)
+
+#         domain_vectors = torch.empty(n_dm, n_dmx, ctx_dim, dtype=dtype)
+#         nn.init.normal_(domain_vectors, std=0.02)
+#         self.domain_vectors = nn.Parameter(domain_vectors)
+
+#         print(f'Initial context: "{prompt_prefix}"')
+#         print(f"Number of context words (tokens): {n_ctx}")
+#         print(f"Number of domain context words (tokens): {n_dmx}")
+
+#         self.ctx = nn.Parameter(ctx_vectors)  # to be optimized
+
+#         classnames = [name.replace("_", " ") for name in classnames]
+#         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
+#         naive_prompts = [
+#             naive_prompt_prefix + " " + name + "." for name in classnames
+#         ]
+
+#         prompts = [
+#             prompt_prefix + " " + name + " " + domain + " an image from a domain." #"."  
+#             for domain in domainnames for name in classnames
+#         ]
+
+#         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
+#         naive_tokenized_prompts = torch.cat(
+#             [clip.tokenize(p) for p in naive_prompts])
+
+#         with torch.no_grad():
+#             embedding = clip_model.token_embedding(tokenized_prompts).type(
+#                 dtype)
+#             naive_embedding = clip_model.token_embedding(
+#                 naive_tokenized_prompts).type(dtype)
+
+#         # These token vectors will be saved when in save_model(),
+#         # but they should be ignored in load_model() as we want to use
+#         # those computed using the current class names
+#         tokenized_prompts = torch.cat(
+#             [tokenized_prompts, naive_tokenized_prompts])
+        
+        
+
+#         self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
+#         self.register_buffer("token_middle1", embedding[:, 1+n_datt : n_datt+1+1, :])
+#         self.register_buffer("token_middle2", embedding[:, 1+n_datt+1+n_datt : 1+n_datt+1+n_datt+1, :])
+#         self.register_buffer("token_middle3", embedding[:, 1+n_datt+1+n_datt+1+n_datt : 1+n_datt+1+n_datt+1+n_datt+1, :])
+#         self.register_buffer("token_suffix", embedding[:,
+#                                                        1 + domain_prefix_len+n:, :])  # CLS, EOS
+
+#         self.n_cls = n_cls
+#         self.n_ctx = n_ctx
+#         self.csc = cfg.TRAINER.ADAPT.CSC
+#         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+#         self.name_lens = name_lens
+#         self.naive_embedding = naive_embedding.to(
+#             torch.device("cuda"))
+
+#     @autocast()
+#     def forward(self):
+#         ctx = self.ctx
+#         ctx_dim = ctx.size(-1)
+#         dtx_att1 = self.dtx_att1
+#         dtx_att2 = self.dtx_att2
+#         dtx_att3 = self.dtx_att3
+#         dmx = self.domain_vectors  # dm 16 512
+#         if ctx.dim() == 2:
+#             ctx = ctx.unsqueeze(0).expand(self.n_dm, -1, -1)  # dm 16 512
+#             if not self.csc:
+#                 ctx = ctx.unsqueeze(1).expand(-1, self.n_cls, -1,
+#                                               -1)  # dm cls 16 512
+#         else:
+#             ctx = ctx.unsqueeze(0).expand(self.n_dm, -1, -1,
+#                                           -1)  # dm cls 16 512
+
+#         dtx_att1 = dtx_att1.unsqueeze(1).expand(-1, self.n_cls, -1, -1)  # dm cls 16 512
+#         dtx_att2 = dtx_att2.unsqueeze(1).expand(-1, self.n_cls, -1, -1)  # dm cls 16 512
+#         dtx_att3 = dtx_att3.unsqueeze(1).expand(-1, self.n_cls, -1, -1)  # dm cls 16 512
+#         dmx = dmx.unsqueeze(1).expand(-1, self.n_cls, -1, -1)  # dm cls 16 512
+#         ctxdmx = torch.cat([ctx, dmx],
+#                            dim=2).reshape(self.n_cls * self.n_dm,
+#                                           self.n_ctx + self.n_dmx, ctx_dim)
+
+#         prefix = self.token_prefix
+#         suffix = self.token_suffix
+
+#         middle_attribute1 = self.token_middle1
+#         middle_attribute2 = self.token_middle2
+#         middle_attribute3 = self.token_middle3
+
+#         ctx=ctx.reshape(self.n_dm*self.n_cls,-1,ctx_dim)
+#         dtx_att1=dtx_att1.reshape(self.n_dm*self.n_cls,-1,ctx_dim)
+#         dtx_att2=dtx_att2.reshape(self.n_dm*self.n_cls,-1,ctx_dim)
+#         dtx_att3=dtx_att3.reshape(self.n_dm*self.n_cls,-1,ctx_dim)
+
+#         # naive
+#         neb = self.naive_embedding
+
+#         # prompts = torch.cat(
+#         #     [
+#         #         prefix,  # (n_cls, 1, dim)
+#         #         ctxdm,  # (n_cls, n_ctx, dim)
+#         #         suffix,  # (n_cls, *, dim)
+#         #     ],
+#         #     dim=1,
+#         # )
+#         prompts = torch.cat(
+#             [
+#                 prefix,  # (n_cls, 1, dim)
+#                 dtx_att1,  # (n_cls, n_ctx, dim)
+#                 middle_attribute1,
+#                 dtx_att2,
+#                 middle_attribute2,
+#                 dtx_att3,
+#                 middle_attribute3,
+#                 ctxdmx,
+#                 suffix,  # (n_cls, *, dim)
+#             ],
+#             dim=1,
+#         )
+#         prompts = torch.cat([prompts, neb], dim=0)
+
+#         return prompts
+
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
@@ -215,9 +387,9 @@ class CustomCLIP(nn.Module):
 
 
 @TRAINER_REGISTRY.register()
-class DAPL(TrainerXU):
+class ADAPT(TrainerXU):
     def check_cfg(self, cfg):
-        assert cfg.TRAINER.DAPL.PREC in ["fp16", "fp32", "amp"]
+        assert cfg.TRAINER.ADAPT.PREC in ["fp16", "fp32", "amp"]
 
     def build_model(self):
         cfg = self.cfg
@@ -226,7 +398,7 @@ class DAPL(TrainerXU):
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
 
-        if cfg.TRAINER.DAPL.PREC == "fp32" or cfg.TRAINER.DAPL.PREC == "amp":
+        if cfg.TRAINER.ADAPT.PREC == "fp32" or cfg.TRAINER.ADAPT.PREC == "amp":
             # CLIP's default precision is fp16
             clip_model.float()
 
@@ -277,7 +449,7 @@ class DAPL(TrainerXU):
         register the module before use
         '''
         self.register_model("prompt_learner", self.model, self.optim, self.sched) 
-        self.scaler = GradScaler() if cfg.TRAINER.DAPL.PREC == "amp" else None
+        self.scaler = GradScaler() if cfg.TRAINER.ADAPT.PREC == "amp" else None
 
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
@@ -421,11 +593,11 @@ class DAPL(TrainerXU):
 
     def forward_backward_prompt_learner(self, batch_x, batch_u):
         image_x, label, image_u = self.parse_batch_train(batch_x, batch_u)
-        prec = self.cfg.TRAINER.DAPL.PREC
+        prec = self.cfg.TRAINER.ADAPT.PREC
         if prec == "amp":
             with autocast():
-                output_x, _ = self.model(image_x) #[32,36] cls=12 [source+target+pseuo]
-                output_u, _ = self.model(image_u)
+                output_x, _, _ = self.model(image_x) #[32,36] cls=12 [source+target+pseuo]
+                output_u, _,_ = self.model(image_u)
 
                 domain_x_label = torch.zeros(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
                 domain_u_label = torch.ones(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
@@ -445,11 +617,11 @@ class DAPL(TrainerXU):
                 # only clip annotation
                 pseudo_label = torch.softmax(
                     output_u[:, -self.n_cls:].reshape(-1, self.n_cls) /
-                    self.cfg.TRAINER.DAPL.T,
+                    self.cfg.TRAINER.ADAPT.T,
                     dim=-1)
 
                 max_probs, label_p = torch.max(pseudo_label, dim=-1)
-                mask = max_probs.ge(self.cfg.TRAINER.DAPL.TAU).float()
+                mask = max_probs.ge(self.cfg.TRAINER.ADAPT.TAU).float()
 
                 #source CE LOSS
                 output_x_soft = torch.softmax(output_x[:, :self.n_cls], dim=1)
@@ -484,7 +656,7 @@ class DAPL(TrainerXU):
 
                 lam = 2 / (1 + math.exp(-1 * 10 * self.epoch / self.max_epoch)) - 1
 
-                loss = loss_x + self.cfg.TRAINER.DAPL.U * loss_u + ((class_loss_x + class_loss_u * 0.1) + (domain_loss_x + domain_loss_u) * lam)*1
+                loss = loss_x + self.cfg.TRAINER.ADAPT.U * loss_u + ((class_loss_x + class_loss_u*0.1) + (domain_loss_x + domain_loss_u) * lam)*1
 
             self.optim.zero_grad()
             self.scaler.scale(loss).backward()
@@ -512,15 +684,15 @@ class DAPL(TrainerXU):
         entropy = torch.sum(entropy, dim=1)
         return entropy
 
-     def forward_backward_VPT(self, batch_x, batch_u):
+    def forward_backward_VPT(self, batch_x, batch_u):
         image_x, label, image_u = self.parse_batch_train(batch_x, batch_u)
-        prec = self.cfg.TRAINER.DAPL.PREC
+        prec = self.cfg.TRAINER.ADAPT.PREC
 
         if prec == "amp":
             with autocast():
                 # train vision prompt
-                output_x = self.model(image_x)
-                output_u = self.model(image_u)
+                output_x, _, _ = self.model(image_x)
+                output_u, _, _ = self.model(image_u)
 
                 domain_x_label = torch.zeros(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
                 domain_u_label = torch.ones(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
@@ -560,11 +732,11 @@ class DAPL(TrainerXU):
                 # only clip annotation
                 pseudo_label = torch.softmax(
                     output_u[:, -self.n_cls:].reshape(-1, self.n_cls) /
-                    self.cfg.TRAINER.DAPL.T,
+                    self.cfg.TRAINER.ADAPT.T,
                     dim=-1)
 
                 max_probs, label_p = torch.max(pseudo_label, dim=-1)
-                mask = max_probs.ge(self.cfg.TRAINER.DAPL.TAU).float()
+                mask = max_probs.ge(self.cfg.TRAINER.ADAPT.TAU).float()
 
                 output_u_soft = torch.softmax(output_u[:, self.n_cls:2 * self.n_cls], dim=1)
                 loss_u = (F.cross_entropy(output_u_soft, label_p, reduction="none") * mask).sum() / mask.sum()
@@ -583,8 +755,8 @@ class DAPL(TrainerXU):
 
 
                 lam = 2 / (1 + math.exp(-1 * 10 * self.epoch / self.max_epoch)) - 1
-                loss_G = self.cfg.TRAINER.DAPL.U * loss_u + im_loss - (
-                            (class_loss_x_G + class_loss_u_G) - (domain_loss_x + domain_loss_u) * lam)
+                loss_G = self.cfg.TRAINER.ADAPT.U * loss_u + im_loss - (
+                            (class_loss_x_G + class_loss_u_G) + (domain_loss_x + domain_loss_u) * lam)
 
             self.optim.zero_grad()
             self.scaler.scale(loss_G).backward()
@@ -668,7 +840,7 @@ class DAPL(TrainerXU):
             # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
 
-   @torch.no_grad()
+    @torch.no_grad()
     def test(self, split=None):
         """A generic testing pipeline."""
         self.set_model_mode("eval")
@@ -682,7 +854,7 @@ class DAPL(TrainerXU):
 
         for batch_idx, batch in enumerate(data_loader):
             input, label = self.parse_batch_test(batch)
-            output = self.model_inference(input).reshape(
+            output = self.model_inference(input)[0].reshape(
                 -1, self.n_dm, self.n_cls)
             # the last second slice is the logits for target domain
             output = output[:, -2, :]

@@ -35,12 +35,12 @@ TRAINER:
     PREC: "amp"
     N_DMX: 2
     N_CTX: 2
-    CSC: False
+    CSC: True
     T: 1.0
     TAU: 0.8
     U: 1.0
 
-    PROMPT_DEPTH_VISION: 1
-    PROMPT_DEPTH_TEXT: 1
+    PROMPT_DEPTH_VISION: 12
+    PROMPT_DEPTH_TEXT: 12
     N_CTX_VISION: 2
     N_CTX_TEXT: 4
