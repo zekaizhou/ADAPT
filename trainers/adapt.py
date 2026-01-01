@@ -694,21 +694,23 @@ class ADAPT(TrainerXU):
                 output_x, _, _ = self.model(image_x) #[32,36] cls=12 [source+target+pseuo]
                 output_u, _, _ = self.model(image_u)
 
-                #output_x_p=nn.Softmax(dim=1)(output_x)
-                #output_u_p=nn.Softmax(dim=1)(output_u)
+                output_x_p=nn.Softmax(dim=1)(output_x)
+                output_u_p=nn.Softmax(dim=1)(output_u)
 
                 domain_x_label = torch.zeros(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
                 domain_u_label = torch.ones(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
+                # domain_u_label = torch.zeros(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
+                # domain_x_label = torch.ones(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
 
-                source_domain_token_x = torch.logsumexp(output_x[:, :self.n_cls], dim=1)
-                target_domain_token_x = torch.logsumexp(output_x[:, self.n_cls:2 * self.n_cls], dim=1)
+                source_domain_token_x = torch.sum(output_x_p[:, :self.n_cls], dim=1)
+                target_domain_token_x = torch.sum(output_x_p[:, self.n_cls:2 * self.n_cls], dim=1)
                 domain_token_x = torch.stack((source_domain_token_x, target_domain_token_x), dim=1)
                 # domain_x_soft = torch.softmax(domain_token_x, dim=1)
                 # domain_loss_x = F.cross_entropy(domain_x_soft, domain_x_label)
                 domain_loss_x = F.cross_entropy(domain_token_x, domain_x_label)
 
-                source_domain_token_u = torch.logsumexp(output_u[:, :self.n_cls], dim=1)
-                target_domain_token_u = torch.logsumexp(output_u[:, self.n_cls:2 * self.n_cls], dim=1)
+                source_domain_token_u = torch.sum(output_u_p[:, :self.n_cls], dim=1)
+                target_domain_token_u = torch.sum(output_u_p[:, self.n_cls:2 * self.n_cls], dim=1)
                 domain_token_u = torch.stack((source_domain_token_u, target_domain_token_u), dim=1)
                 # domain_u_soft = torch.softmax(domain_token_u, dim=1)
                 # domain_loss_u = F.cross_entropy(domain_u_soft, domain_u_label)
@@ -733,41 +735,41 @@ class ADAPT(TrainerXU):
                 # loss_u = (F.cross_entropy(output_u_soft, label_p, reduction="none") * mask).sum() / mask.sum()
                 loss_u = (F.cross_entropy(output_u[:, self.n_cls:2 * self.n_cls], label_p, reduction="none") * mask).sum() / mask.sum()
 
-                source_class = torch.randn(output_x.size(0)).to(torch.device("cuda"))
-                target_class = torch.randn(output_x.size(0)).to(torch.device("cuda"))
-                source_class_token = output_x[:, :self.n_cls]  # [32,12]
-                target_class_token = output_x[:, self.n_cls:2 * self.n_cls]
-                for i in range(output_x.size(0)):
-                    source_class[i] = source_class_token[i, label[i]]
-                    target_class[i] = target_class_token[i, label[i]]
-                class_token = torch.stack((source_class, target_class), dim=1)
-                #soft_class_token = torch.softmax(class_token, dim=1)
-                class_loss_x = F.cross_entropy(class_token, domain_x_label)
+                # source_class = torch.randn(output_x.size(0)).to(torch.device("cuda"))
+                # target_class = torch.randn(output_x.size(0)).to(torch.device("cuda"))
+                # source_class_token = output_x[:, :self.n_cls]  # [32,12]
+                # target_class_token = output_x[:, self.n_cls:2 * self.n_cls]
+                # for i in range(output_x.size(0)):
+                #     source_class[i] = source_class_token[i, label[i]]
+                #     target_class[i] = target_class_token[i, label[i]]
+                # class_token = torch.stack((source_class, target_class), dim=1)
+                # #soft_class_token = torch.softmax(class_token, dim=1)
+                # class_loss_x = F.cross_entropy(class_token, domain_x_label)
 
-                source_class_u = torch.randn(output_u.size(0)).to(torch.device("cuda"))
-                target_class_u = torch.randn(output_u.size(0)).to(torch.device("cuda"))
-                source_class_token_u = output_u[:, :self.n_cls]  # [32,12]
-                target_class_token_u = output_u[:, self.n_cls:2 * self.n_cls]
-                for i in range(output_u.size(0)):
-                    source_class_u[i] = source_class_token_u[i, label_p[i]]
-                    target_class_u[i] = target_class_token_u[i, label_p[i]]
-                class_token_u = torch.stack((source_class_u, target_class_u), dim=1)
-                #soft_class_token_u = torch.softmax(class_token_u, dim=1)
-                class_loss_u = (F.cross_entropy(class_token_u, domain_u_label,
-                                                  reduction="none") * mask).sum() / mask.sum()
+                # source_class_u = torch.randn(output_u.size(0)).to(torch.device("cuda"))
+                # target_class_u = torch.randn(output_u.size(0)).to(torch.device("cuda"))
+                # source_class_token_u = output_u[:, :self.n_cls]  # [32,12]
+                # target_class_token_u = output_u[:, self.n_cls:2 * self.n_cls]
+                # for i in range(output_u.size(0)):
+                #     source_class_u[i] = source_class_token_u[i, label_p[i]]
+                #     target_class_u[i] = target_class_token_u[i, label_p[i]]
+                # class_token_u = torch.stack((source_class_u, target_class_u), dim=1)
+                # #soft_class_token_u = torch.softmax(class_token_u, dim=1)
+                # class_loss_u = (F.cross_entropy(class_token_u, domain_u_label,
+                #                                   reduction="none") * mask).sum() / mask.sum()
 
                 mask_l = max_probs > self.cfg.TRAINER.ADAPT.TAU # 论文中的 gamma 阈值
-                filtered_output_u_p = output_u[mask_l]
+                filtered_output_u_p = output_u_p[mask_l]
                 filtered_pseudo_labels = label_p[mask_l]
 
-                loss_c_dom = self.compute_L_dom_c(output_x, filtered_output_u_p, label, filtered_pseudo_labels, self.K)
+                loss_c_dom = self.compute_L_dom_c(output_x_p, filtered_output_u_p, label, filtered_pseudo_labels, self.K)
 
 
 
 
                 #lam = 2 / (1 + math.exp(-1 * 10 * self.epoch / self.max_epoch)) - 1
 
-                loss = loss_x + self.cfg.TRAINER.ADAPT.U * loss_u - (loss_c_dom + (domain_loss_x + domain_loss_u))
+                loss = loss_x + self.cfg.TRAINER.ADAPT.U * loss_u + (loss_c_dom + (domain_loss_x + domain_loss_u))
 
             self.optim.zero_grad()
             self.scaler.scale(loss).backward()
@@ -816,26 +818,26 @@ class ADAPT(TrainerXU):
         if prec == "amp":
             with autocast():
                 # train vision prompt
-                output_x, image_features_x, _ = self.model(image_x)
-                output_u, image_features_u, _ = self.model(image_u)
+                output_x, _, _ = self.model(image_x)
+                output_u, _, _ = self.model(image_u)
 
-                #output_x_p=nn.Softmax(dim=1)(output_x)
-                #output_u_p=nn.Softmax(dim=1)(output_u)
+                output_x_p=nn.Softmax(dim=1)(output_x)
+                output_u_p=nn.Softmax(dim=1)(output_u)
 
                 domain_x_label = torch.zeros(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
                 domain_u_label = torch.ones(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
                 # domain_u_label = torch.zeros(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
                 # domain_x_label = torch.ones(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
 
-                source_domain_token_x = torch.logsumexp(output_x[:, :self.n_cls], dim=1)
-                target_domain_token_x = torch.logsumexp(output_x[:, self.n_cls:2 * self.n_cls], dim=1)
+                source_domain_token_x = torch.sum(output_x_p[:, :self.n_cls], dim=1)
+                target_domain_token_x = torch.sum(output_x_p[:, self.n_cls:2 * self.n_cls], dim=1)
                 domain_token_x = torch.stack((source_domain_token_x, target_domain_token_x), dim=1)
                 # domain_x_soft = torch.softmax(domain_token_x, dim=1)
                 # domain_loss_x = F.cross_entropy(domain_x_soft, domain_x_label)
                 domain_loss_x = F.cross_entropy(domain_token_x, domain_x_label)
 
-                source_domain_token_u = torch.logsumexp(output_u[:, :self.n_cls], dim=1)
-                target_domain_token_u = torch.logsumexp(output_u[:, self.n_cls:2 * self.n_cls], dim=1)
+                source_domain_token_u = torch.sum(output_u_p[:, :self.n_cls], dim=1)
+                target_domain_token_u = torch.sum(output_u_p[:, self.n_cls:2 * self.n_cls], dim=1)
                 domain_token_u = torch.stack((source_domain_token_u, target_domain_token_u), dim=1)
                 # domain_u_soft = torch.softmax(domain_token_u, dim=1)
                 # domain_loss_u = F.cross_entropy(domain_u_soft, domain_u_label)
@@ -849,17 +851,17 @@ class ADAPT(TrainerXU):
                 entropy_loss -= torch.sum(-msoftmax * torch.log(msoftmax + 1e-5))
                 im_loss = entropy_loss
 
-                source_class = torch.randn(output_x.size(0)).to(torch.device("cuda"))
-                target_class = torch.randn(output_x.size(0)).to(torch.device("cuda"))
-                source_class_token = output_x[:, :self.n_cls]  # [32,12]
-                target_class_token = output_x[:, self.n_cls:2 * self.n_cls]
-                for i in range(output_x.size(0)):
-                    source_class[i] = source_class_token[i, label[i]]
-                    target_class[i] = target_class_token[i, label[i]]
+                # source_class = torch.randn(output_x.size(0)).to(torch.device("cuda"))
+                # target_class = torch.randn(output_x.size(0)).to(torch.device("cuda"))
+                # source_class_token = output_x[:, :self.n_cls]  # [32,12]
+                # target_class_token = output_x[:, self.n_cls:2 * self.n_cls]
+                # for i in range(output_x.size(0)):
+                #     source_class[i] = source_class_token[i, label[i]]
+                #     target_class[i] = target_class_token[i, label[i]]
 
-                class_token = torch.stack((source_class, target_class), dim=1)
-                #soft_class_token = torch.softmax(class_token, dim=1)
-                class_loss_x_G = F.cross_entropy(class_token, domain_x_label)
+                # class_token = torch.stack((source_class, target_class), dim=1)
+                # #soft_class_token = torch.softmax(class_token, dim=1)
+                # class_loss_x_G = F.cross_entropy(class_token, domain_x_label)
 
                 # only clip annotation
                 pseudo_label = torch.softmax(
@@ -874,26 +876,26 @@ class ADAPT(TrainerXU):
                 # loss_u = (F.cross_entropy(output_u_soft, label_p, reduction="none") * mask).sum() / mask.sum()
                 loss_u = (F.cross_entropy(output_u[:, self.n_cls:2 * self.n_cls], label_p, reduction="none") * mask).sum() / mask.sum()
 
-                source_class_u = torch.randn(32).to(torch.device("cuda"))
-                target_class_u = torch.randn(32).to(torch.device("cuda"))
-                source_class_token_u = output_u[:, :self.n_cls]  # [32,12]
-                target_class_token_u = output_u[:, self.n_cls:2 * self.n_cls]
-                for i in range(32):
-                    source_class_u[i] = source_class_token_u[i, label_p[i]]
-                    target_class_u[i] = target_class_token_u[i, label_p[i]]
-                class_token_u = torch.stack((source_class_u, target_class_u), dim=1)
-                #soft_class_token_u = torch.softmax(class_token_u, dim=1)
-                class_loss_u_G = (F.cross_entropy(class_token_u, domain_u_label,
-                                                reduction="none") * mask).sum() / mask.sum()
+                # source_class_u = torch.randn(32).to(torch.device("cuda"))
+                # target_class_u = torch.randn(32).to(torch.device("cuda"))
+                # source_class_token_u = output_u[:, :self.n_cls]  # [32,12]
+                # target_class_token_u = output_u[:, self.n_cls:2 * self.n_cls]
+                # for i in range(32):
+                #     source_class_u[i] = source_class_token_u[i, label_p[i]]
+                #     target_class_u[i] = target_class_token_u[i, label_p[i]]
+                # class_token_u = torch.stack((source_class_u, target_class_u), dim=1)
+                # #soft_class_token_u = torch.softmax(class_token_u, dim=1)
+                # class_loss_u_G = (F.cross_entropy(class_token_u, domain_u_label,
+                #                                 reduction="none") * mask).sum() / mask.sum()
 
                 # loss_mmd = self.mmd_loss_func(image_features_x, image_features_u)
 
                 mask_l = max_probs > self.cfg.TRAINER.ADAPT.TAU # 论文中的 gamma 阈值
-                filtered_output_u_p = output_u[mask_l]
+                filtered_output_u_p = output_u_p[mask_l]
                 filtered_pseudo_labels = label_p[mask_l]
 
 
-                loss_c_dom = self.compute_L_dom_c(output_x, filtered_output_u_p, label, filtered_pseudo_labels, self.K)
+                loss_c_dom = self.compute_L_dom_c(output_x_p, filtered_output_u_p, label, filtered_pseudo_labels, self.K)
 
 
                 #lam = 2 / (1 + math.exp(-1 * 10 * self.epoch / self.max_epoch)) - 1
