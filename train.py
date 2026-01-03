@@ -7,7 +7,7 @@ from dassl.config import get_cfg_default
 from dassl.engine import build_trainer
 from torch.cuda import init
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 # custom
 from dassl.data.datasets import VisDA17
