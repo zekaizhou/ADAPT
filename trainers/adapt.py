@@ -25,6 +25,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
 
+import copy
+
 from scipy.stats import entropy
 
 from sklearn.metrics.pairwise import euclidean_distances
@@ -44,11 +46,12 @@ def load_clip_to_cpu(cfg):
 
     except RuntimeError:
         state_dict = torch.load(model_path, map_location="cpu")
-    design_details = {"trainer": 'IVLP',
+    design_details = {"trainer": 'MaPLe',
                       "vision_depth": cfg.TRAINER.ADAPT.PROMPT_DEPTH_VISION,
                       "language_depth": cfg.TRAINER.ADAPT.PROMPT_DEPTH_TEXT,
                       "vision_ctx": cfg.TRAINER.ADAPT.N_CTX_VISION,
-                      "language_ctx": cfg.TRAINER.ADAPT.N_CTX_TEXT
+                      "language_ctx": cfg.TRAINER.ADAPT.N_CTX_TEXT,
+                      "maple_length": cfg.TRAINER.ADAPT.N_CTX_TEXT,
                       }
     model = clip.build_model(state_dict or model.state_dict(), design_details)
 
@@ -64,20 +67,23 @@ class TextEncoder(nn.Module):
         self.text_projection = clip_model.text_projection
         self.dtype = clip_model.dtype
 
-    @autocast()
-    def forward(self, prompts, tokenized_prompts):
+    def forward(self, prompts, tokenized_prompts, compound_prompts_deeper_text):
         x = prompts + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        # Pass as the list, as nn.sequential cannot process multiple arguments in the forward pass
+        combined = [x, compound_prompts_deeper_text, 0]  # third argument is the counter which denotes depth of prompt
+        outputs = self.transformer(combined)
+        x = outputs[0]  # extract the x back from here
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
 
+        # x.shape = [batch_size, n_ctx, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
 
         return x
 
-
-class PromptLearner(nn.Module):
+class PromptLearner_maple(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         n_cls = len(classnames)
@@ -95,6 +101,9 @@ class PromptLearner(nn.Module):
         self.n_dmx = n_dmx
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
+        assert cfg.TRAINER.ADAPT.PROMPT_DEPTH_TEXT >= 1, "For MaPLe, PROMPT_DEPTH should be >= 1"
+        self.compound_prompts_depth = cfg.TRAINER.ADAPT.PROMPT_DEPTH_TEXT  # max=12, but will create 11 such shared prompts
+
         naive_prompt_prefix = "a photo of a".replace("_", " ")
 
         if cfg.TRAINER.ADAPT.CSC:
@@ -103,7 +112,7 @@ class PromptLearner(nn.Module):
         else:
             print("Initializing a generic context")
             ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
-        nn.init.normal_(ctx_vectors, std=0.02) 
+        nn.init.normal_(ctx_vectors, std=0.02)
         print("ctx vectors size: ") 
         print(ctx_vectors.shape) #[12,16,512]
         prompt_prefix = " ".join(["X"] * n) 
@@ -116,7 +125,35 @@ class PromptLearner(nn.Module):
         print(f"Number of context words (tokens): {n_ctx}")
         print(f"Number of domain context words (tokens): {n_dmx}")
 
-        self.ctx = nn.Parameter(ctx_vectors) 
+
+        #self.proj = nn.Linear(ctx_dim, 768)
+        hidden_dim=ctx_dim
+        self.proj = nn.Sequential(
+            nn.Linear(ctx_dim, hidden_dim),
+            nn.ReLU(),              # 激活函数，也可以用 nn.GELU()
+            nn.Linear(hidden_dim, 768)
+            )
+        self.ctx = nn.Parameter(ctx_vectors)
+        
+
+        # These below parameters related to the shared prompts
+        # Define the compound prompts for the deeper layers
+
+        # Minimum can be 1, which defaults to shallow MaPLe
+        # compound prompts
+        self.compound_prompts_text = nn.ParameterList([nn.Parameter(torch.empty(n, 512))
+                                                      for _ in range(self.compound_prompts_depth - 1)])
+        for single_para in self.compound_prompts_text:
+            nn.init.normal_(single_para, std=0.02)
+        # Also make corresponding projection layers, for each prompt
+        single_layer = nn.Sequential(
+            nn.Linear(ctx_dim, hidden_dim),
+            nn.ReLU(),              # 激活函数，也可以用 nn.GELU()
+            nn.Linear(hidden_dim, 768)
+            )
+        self.compound_prompt_projections = _get_clones(single_layer, self.compound_prompts_depth - 1)
+
+
 
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
@@ -140,7 +177,6 @@ class PromptLearner(nn.Module):
         # These token vectors will be saved when in save_model(),
         # but they should be ignored in load_model() as we want to use
         # those computed using the current class names
-        tokenized_prompts = torch.cat([tokenized_prompts, naive_tokenized_prompts])
         self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
         self.register_buffer("token_suffix", embedding[:, 1 + n:, :])  # CLS, EOS
 
@@ -148,6 +184,7 @@ class PromptLearner(nn.Module):
         self.n_ctx = n_ctx
         self.csc = cfg.TRAINER.ADAPT.CSC
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+        self.naive_tokenized_prompts = naive_tokenized_prompts
         self.name_lens = name_lens
         self.naive_embedding = naive_embedding.to(torch.device("cuda"))
 
@@ -172,8 +209,7 @@ class PromptLearner(nn.Module):
         prefix = self.token_prefix
         suffix = self.token_suffix
 
-        neb = self.naive_embedding
-
+    
         prompts = torch.cat(
             [
                 prefix,  # (n_cls, 1, dim) [24,1,512]
@@ -182,208 +218,75 @@ class PromptLearner(nn.Module):
             ],
             dim=1,
         )
-        neb = neb.to(prompts.device)
-        prompts = torch.cat([prompts, neb], dim=0)  #[24, 77, 512]
+        #neb = neb.to(prompts.device)
+        #prompts = torch.cat([prompts, neb], dim=0)  #[24, 77, 512]
 
-        return prompts 
+        visual_deep_prompts = []
+        for index, layer in enumerate(self.compound_prompt_projections):
+            visual_deep_prompts.append(layer(self.compound_prompts_text[index]))
+        # Now the other way around
+        # We will project the textual prompts from 512 to 768
 
-# class PromptLearner(nn.Module):
-#     def __init__(self, cfg, classnames, clip_model):
-#         super().__init__()
-#         n_cls = len(classnames)
-#         n_ctx = cfg.TRAINER.ADAPT.N_CTX
+        return prompts, self.proj(ctxdmx.mean(dim=0)), self.compound_prompts_text, visual_deep_prompts  
 
-#         dtype = clip_model.dtype
-#         ctx_dim = clip_model.ln_final.weight.shape[0]
-#         clip_imsize = clip_model.visual.input_resolution
-#         cfg_imsize = cfg.INPUT.SIZE[0]
-#         domainnames = cfg.DATASET.SOURCE_DOMAINS + cfg.DATASET.TARGET_DOMAINS
-#         domainnames = [
-#             ", a {} image.".format(domain) for domain in domainnames
-#         ]
-#         n_dm = len(cfg.DATASET.SOURCE_DOMAINS) + len(
-#             cfg.DATASET.TARGET_DOMAINS)  # number of domains
-#         n_dmx = cfg.TRAINER.ADAPT.N_DMX  # number of domain context
-
-#         n_datt=4
-#         d_atts=["style","texture","shape"]
-#         n = n_dmx + n_ctx
-#         self.n_dm = n_dm
-#         self.n_dmx = n_dmx
-#         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
-
-#         naive_prompt_prefix = "a photo of a".replace("_", " ")
-
-#         if cfg.TRAINER.ADAPT.CSC:
-#             print("Initializing class-specific contexts")
-#             ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
-#         else:
-#             print("Initializing a generic context")
-#             ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
-#         nn.init.normal_(ctx_vectors, std=0.02)
-#         print("ctx vectors size: ".format(ctx_vectors.size()))
-#         domain_prefix = " ".join(["X"] * n_datt)+" "+d_atts[0]+" "+" ".join(["X"] * n_datt)+" "+d_atts[1]+" "+" ".join(["X"] * n_datt)+" "+d_atts[2]
-
-#         domain_prefix_len=len(_tokenizer.encode(domain_prefix))
-#         prompt_prefix = domain_prefix+" "+" ".join(["X"] * n)
-
-#         att_vectors_1 = torch.empty(n_dm, n_datt, ctx_dim, dtype=dtype)
-#         att_vectors_2 = torch.empty(n_dm, n_datt, ctx_dim, dtype=dtype)
-#         att_vectors_3 = torch.empty(n_dm, n_datt, ctx_dim, dtype=dtype)
-
-#         nn.init.normal_(att_vectors_1, std=0.01)
-#         nn.init.normal_(att_vectors_2, std=0.01)
-#         nn.init.normal_(att_vectors_3, std=0.01)
-
-#         self.dtx_att1 = nn.Parameter(att_vectors_1)
-#         self.dtx_att2 = nn.Parameter(att_vectors_2)
-#         self.dtx_att3 = nn.Parameter(att_vectors_3)
-
-#         domain_vectors = torch.empty(n_dm, n_dmx, ctx_dim, dtype=dtype)
-#         nn.init.normal_(domain_vectors, std=0.02)
-#         self.domain_vectors = nn.Parameter(domain_vectors)
-
-#         print(f'Initial context: "{prompt_prefix}"')
-#         print(f"Number of context words (tokens): {n_ctx}")
-#         print(f"Number of domain context words (tokens): {n_dmx}")
-
-#         self.ctx = nn.Parameter(ctx_vectors)  # to be optimized
-
-#         classnames = [name.replace("_", " ") for name in classnames]
-#         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
-#         naive_prompts = [
-#             naive_prompt_prefix + " " + name + "." for name in classnames
-#         ]
-
-#         prompts = [
-#             prompt_prefix + " " + name + " " + domain + " an image from a domain." #"."  
-#             for domain in domainnames for name in classnames
-#         ]
-
-#         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
-#         naive_tokenized_prompts = torch.cat(
-#             [clip.tokenize(p) for p in naive_prompts])
-
-#         with torch.no_grad():
-#             embedding = clip_model.token_embedding(tokenized_prompts).type(
-#                 dtype)
-#             naive_embedding = clip_model.token_embedding(
-#                 naive_tokenized_prompts).type(dtype)
-
-#         # These token vectors will be saved when in save_model(),
-#         # but they should be ignored in load_model() as we want to use
-#         # those computed using the current class names
-#         tokenized_prompts = torch.cat(
-#             [tokenized_prompts, naive_tokenized_prompts])
-        
-        
-
-#         self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
-#         self.register_buffer("token_middle1", embedding[:, 1+n_datt : n_datt+1+1, :])
-#         self.register_buffer("token_middle2", embedding[:, 1+n_datt+1+n_datt : 1+n_datt+1+n_datt+1, :])
-#         self.register_buffer("token_middle3", embedding[:, 1+n_datt+1+n_datt+1+n_datt : 1+n_datt+1+n_datt+1+n_datt+1, :])
-#         self.register_buffer("token_suffix", embedding[:,
-#                                                        1 + domain_prefix_len+n:, :])  # CLS, EOS
-
-#         self.n_cls = n_cls
-#         self.n_ctx = n_ctx
-#         self.csc = cfg.TRAINER.ADAPT.CSC
-#         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
-#         self.name_lens = name_lens
-#         self.naive_embedding = naive_embedding.to(
-#             torch.device("cuda"))
-
-#     @autocast()
-#     def forward(self):
-#         ctx = self.ctx
-#         ctx_dim = ctx.size(-1)
-#         dtx_att1 = self.dtx_att1
-#         dtx_att2 = self.dtx_att2
-#         dtx_att3 = self.dtx_att3
-#         dmx = self.domain_vectors  # dm 16 512
-#         if ctx.dim() == 2:
-#             ctx = ctx.unsqueeze(0).expand(self.n_dm, -1, -1)  # dm 16 512
-#             if not self.csc:
-#                 ctx = ctx.unsqueeze(1).expand(-1, self.n_cls, -1,
-#                                               -1)  # dm cls 16 512
-#         else:
-#             ctx = ctx.unsqueeze(0).expand(self.n_dm, -1, -1,
-#                                           -1)  # dm cls 16 512
-
-#         dtx_att1 = dtx_att1.unsqueeze(1).expand(-1, self.n_cls, -1, -1)  # dm cls 16 512
-#         dtx_att2 = dtx_att2.unsqueeze(1).expand(-1, self.n_cls, -1, -1)  # dm cls 16 512
-#         dtx_att3 = dtx_att3.unsqueeze(1).expand(-1, self.n_cls, -1, -1)  # dm cls 16 512
-#         dmx = dmx.unsqueeze(1).expand(-1, self.n_cls, -1, -1)  # dm cls 16 512
-#         ctxdmx = torch.cat([ctx, dmx],
-#                            dim=2).reshape(self.n_cls * self.n_dm,
-#                                           self.n_ctx + self.n_dmx, ctx_dim)
-
-#         prefix = self.token_prefix
-#         suffix = self.token_suffix
-
-#         middle_attribute1 = self.token_middle1
-#         middle_attribute2 = self.token_middle2
-#         middle_attribute3 = self.token_middle3
-
-#         ctx=ctx.reshape(self.n_dm*self.n_cls,-1,ctx_dim)
-#         dtx_att1=dtx_att1.reshape(self.n_dm*self.n_cls,-1,ctx_dim)
-#         dtx_att2=dtx_att2.reshape(self.n_dm*self.n_cls,-1,ctx_dim)
-#         dtx_att3=dtx_att3.reshape(self.n_dm*self.n_cls,-1,ctx_dim)
-
-#         # naive
-#         neb = self.naive_embedding
-
-#         # prompts = torch.cat(
-#         #     [
-#         #         prefix,  # (n_cls, 1, dim)
-#         #         ctxdm,  # (n_cls, n_ctx, dim)
-#         #         suffix,  # (n_cls, *, dim)
-#         #     ],
-#         #     dim=1,
-#         # )
-#         prompts = torch.cat(
-#             [
-#                 prefix,  # (n_cls, 1, dim)
-#                 dtx_att1,  # (n_cls, n_ctx, dim)
-#                 middle_attribute1,
-#                 dtx_att2,
-#                 middle_attribute2,
-#                 dtx_att3,
-#                 middle_attribute3,
-#                 ctxdmx,
-#                 suffix,  # (n_cls, *, dim)
-#             ],
-#             dim=1,
-#         )
-#         prompts = torch.cat([prompts, neb], dim=0)
-
-#         return prompts
 
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
-        self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
+        self.prompt_learner = PromptLearner_maple(cfg, classnames, clip_model)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
+        with torch.no_grad():
+            naive_embedding = self.prompt_learner.naive_embedding
+            naive_embedding = naive_embedding.to("cpu")
+            naive_tokenized_prompts = self.prompt_learner.naive_tokenized_prompts
+            # ... 生成 prompts_naive ...
+            naive_feats = self.text_encoder(naive_embedding,naive_tokenized_prompts, [])
+            # 归一化
+            naive_feats = naive_feats / naive_feats.norm(dim=-1, keepdim=True)
+            
+            # 【关键】注册为 buffer，这样它会自动随模型移动到 GPU，并保存到 state_dict
+            self.register_buffer("naive_text_features", naive_feats)
+
+
+        
+
     @autocast()
     def forward(self, image):
         tokenized_prompts = self.tokenized_prompts
         logit_scale = self.logit_scale.exp()
 
-        prompts = self.prompt_learner()
-        text_features = self.text_encoder(prompts, tokenized_prompts)
-        image_features = self.image_encoder(image.type(self.dtype))  # [32, 512]
+        prompts, shared_ctx, deep_compound_prompts_text, deep_compound_prompts_vision = self.prompt_learner()
+
+        # --- 2. 获取原始不带 VPT 的特征 (用于生成伪标签) ---
+        # 技巧：临时禁用提示词注入，或者调用基础的编码逻辑
+        # 如果代码支持，可以这样写：
+        with torch.no_grad():
+            # 注意：这里需要确保 image_encoder 内部逻辑可以跳过 prompt 拼接
+            # 或者直接使用 self.image_encoder.forward_original(image)
+            image_features_original = self.image_encoder(image.type(self.dtype), use_vpt=False)
+
+            image_features_original = image_features_original / image_features_original.norm(dim=-1, keepdim=True)
+
+            logits_or = logit_scale * image_features_original @ self.naive_text_features.t()
+            
+
+        text_features = self.text_encoder(prompts, tokenized_prompts, deep_compound_prompts_text)
+        image_features = self.image_encoder(image.type(self.dtype), shared_ctx, deep_compound_prompts_vision)
 
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         logits = logit_scale * image_features @ text_features.t()
 
         # return logits, image_features
-        return logits, image_features, text_features
+        return logits, logits_or, image_features, text_features
+
+def _get_clones(module, N):
+    return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
 
 @TRAINER_REGISTRY.register()
@@ -405,7 +308,7 @@ class ADAPT(TrainerXU):
         print("Building custom CLIP")
         self.model = CustomCLIP(cfg, classnames, clip_model)
 
-        self.n_dm = self.model.prompt_learner.n_dm + 1
+        self.n_dm = self.model.prompt_learner.n_dm
         self.n_cls = self.model.prompt_learner.n_cls
 
         print("Turning off gradients in both the image and the text encoder") 
@@ -536,28 +439,12 @@ class ADAPT(TrainerXU):
                 train_loader_u_iter = iter(self.train_loader_u)
                 batch_u = next(train_loader_u_iter)
 
-            if self.batch_idx % 3 == 0:
-                for name, param in self.model.named_parameters():
-                    if "image_encoder.transformer.resblocks" and "VPT" in name:
-                        param.requires_grad_(True)
-                    else:
-                        param.requires_grad_(False)
-
-            else:
-                for name, param in self.model.named_parameters():
-                    if "prompt_learner" in name:
-                        param.requires_grad_(True)
-                    elif "text_encoder.transformer.resblocks" and "VPT" in name:
-                        param.requires_grad_(True)
-                    else:
-                        param.requires_grad_(False)
 
             data_time.update(time.time() - end)
 
-            if self.batch_idx % 3 == 0:
-                loss_summary = self.forward_backward_VPT(batch_x, batch_u)
-            else:
-                loss_summary = self.forward_backward_prompt_learner(batch_x, batch_u)
+
+            
+            loss_summary = self.forward_backward(batch_x,batch_u)
 
             batch_time.update(time.time() - end)
             losses.update(loss_summary)
@@ -638,211 +525,328 @@ class ADAPT(TrainerXU):
                 loss_c_dom += (loss_s + loss_u)
                 valid_counts += 1
 
-        return loss_c_dom / n_cls if n_cls > 0 else 0
+        return loss_c_dom / valid_counts if valid_counts > 0 else 0
+    
 
-    def compute_L_dom_c_G(self,output_x, output_u, label_x, label_u_pseudo, n_cls):
+    def compute_align_loss_soft(self, output_x, output_u, n_cls, threshold=0.8, T=2.0, mode='correlation'):
         """
-        output_x: 源域 Logits [Batch, 2*K]
-        output_u: 目标域 Logits [Batch, 2*K]
-        label_x: 源域标签
-        label_u_pseudo: 目标域伪标签
-        n_cls: 类别数 K
+        Args:
+            output_x, output_u: Logits [Batch, 2*K]
+            T: 温度系数 (Temperature)，T>1 会软化分布，关注相对关系
+            mode: 'js' (标准JS), 'js_soft' (带温度JS), 'correlation' (皮尔逊相关)
         """
         
-        def get_binary_logits(logits, labels, K):
-            # 提取 p_k 和 p_{K+k}
-            # pk_logits 形状 [Batch, 1]
-            pk_logits = torch.gather(logits[:, :K], 1, labels.unsqueeze(1))
-            pKk_logits = torch.gather(logits[:, K:2*K], 1, labels.unsqueeze(1))
-            # 拼接成 [Batch, 2]，用于做二分类（源域 vs 目标域）
-            return torch.cat([pk_logits, pKk_logits], dim=1)
+        def normalize_slice(logits_slice):
+            # 注意：输入是 logits，不是概率
+            # 在这里进行 Softmax 归一化
+            return F.softmax(logits_slice, dim=1)
 
-        # 1. 提取源域和目标域的二分类 Logits
-        # 源域样本在正确类别下的 [源分类器分值, 目标分类器分值]
-        binary_logits_s = get_binary_logits(output_x, label_x, n_cls)
-        # 目标域样本在伪标签类别下的 [源分类器分值, 目标分类器分值]
-        binary_logits_u = get_binary_logits(output_u, label_u_pseudo, n_cls)
+        def normalize_slice_with_T(logits_slice, T):
+            # 带温度的 Softmax
+            return F.softmax(logits_slice / T, dim=1)
 
-        # 2. 计算损失 (这里手动计算以实现类别平均)
-        loss_c_dom = 0
-        valid_counts = 0
+        # ------------------------------------------------------
+        # 1. 准备数据
+        # ------------------------------------------------------
+        # 切片提取 Logits (还没有做 Softmax)
+        logits_x_s = output_x[:, :n_cls]
+        logits_x_t = output_x[:, n_cls:]
         
-        for k in range(n_cls):
-            mask_s = (label_x == k)
-            mask_u = (label_u_pseudo == k)
+        logits_u_s = output_u[:, :n_cls]
+        logits_u_t = output_u[:, n_cls:]
+
+        # 用于计算 Mask 的置信度 (始终使用原始 Logits 计算真实置信度)
+        with torch.no_grad():
+            p_u_s_raw = F.softmax(logits_u_s, dim=1)
+            p_u_t_raw = F.softmax(logits_u_t, dim=1)
+            avg_p = 0.5 * (p_u_s_raw + p_u_t_raw)
+            max_conf, _ = torch.max(avg_p, dim=1)
+            mask = (max_conf > threshold).float()
+
+        # ------------------------------------------------------
+        # 2. 根据模式计算 Loss
+        # ------------------------------------------------------
+        
+        if mode == 'correlation':
+            # === 方案 A: 皮尔逊相关系数 (只关注趋势) ===
+            # 我们希望两个分布正相关 (Correlation -> 1)，所以 Loss = 1 - Corr
             
-            if mask_s.any() and mask_u.any():
-                # 源域部分: 标签应为 0 (代表源域)
-                loss_s = F.cross_entropy(binary_logits_s[mask_s], 
-                                        torch.ones(mask_s.sum(), dtype=torch.long).to(output_x.device))
-                # 目标域部分: 标签应为 1 (代表目标域)
-                loss_u = F.cross_entropy(binary_logits_u[mask_u], 
-                                        torch.zeros(mask_u.sum(), dtype=torch.long).to(output_x.device))
+            def correlation_loss(x, y):
+                # x, y shape: [Batch, K]
+                # 减去均值
+                x_mean = x - x.mean(dim=1, keepdim=True)
+                y_mean = y - y.mean(dim=1, keepdim=True)
                 
-                loss_c_dom += (loss_s + loss_u)
-                valid_counts += 1
+                # 计算分子：协方差
+                numerator = (x_mean * y_mean).sum(dim=1)
+                
+                # 计算分母：标准差之积
+                denominator = torch.sqrt((x_mean**2).sum(dim=1) * (y_mean**2).sum(dim=1)) + 1e-8
+                
+                # Correlation
+                corr = numerator / denominator
+                return 1 - corr  # Minimize (1 - Correlation)
 
-        return loss_c_dom / n_cls if n_cls > 0 else 0
+            # 概率化 (不需要温度，直接用概率值看形状)
+            p_x_s = F.softmax(logits_x_s, dim=1)
+            p_x_t = F.softmax(logits_x_t, dim=1)
+            p_u_s = F.softmax(logits_u_s, dim=1)
+            p_u_t = F.softmax(logits_u_t, dim=1)
 
-        
+            loss_x = torch.mean(correlation_loss(p_x_s, p_x_t))
+            
+            loss_u_raw = correlation_loss(p_u_s, p_u_t)
+            if mask.sum() > 0:
+                loss_u = torch.sum(loss_u_raw * mask) / mask.sum()
+            else:
+                loss_u = torch.tensor(0.0).to(output_x.device)
 
-    def forward_backward_prompt_learner(self, batch_x, batch_u):
+        elif mode == 'js_soft':
+            # === 方案 B: 带温度的 JS 散度 (软对齐) ===
+            
+            def compute_js(p, q):
+                m = 0.5 * (p + q)
+                kl_p = torch.sum(p * (torch.log(p + 1e-8) - torch.log(m + 1e-8)), dim=1)
+                kl_q = torch.sum(q * (torch.log(q + 1e-8) - torch.log(m + 1e-8)), dim=1)
+                return 0.5 * (kl_p + kl_q)
+
+            # 使用带温度 T 的 Softmax
+            # T 越大，分布越平滑，越只关注相对大小而非绝对值
+            p_x_s = normalize_slice_with_T(logits_x_s, T)
+            p_x_t = normalize_slice_with_T(logits_x_t, T)
+            p_u_s = normalize_slice_with_T(logits_u_s, T)
+            p_u_t = normalize_slice_with_T(logits_u_t, T)
+
+            loss_x = torch.mean(compute_js(p_x_s, p_x_t))
+            
+            js_u = compute_js(p_u_s, p_u_t)
+            if mask.sum() > 0:
+                loss_u = torch.sum(js_u * mask) / mask.sum()
+            else:
+                loss_u = torch.tensor(0.0).to(output_x.device)
+                
+            # 因为 T 会缩小梯度，通常需要把 loss 放大 T^2 倍 (参考知识蒸馏)
+            loss_x *= (T**2)
+            loss_u *= (T**2)
+
+        return loss_x + loss_u
+
+
+    # def forward_backward(self, batch_x, batch_u):
+    #     image_x, label, image_u = self.parse_batch_train(batch_x, batch_u)
+    #     prec = self.cfg.TRAINER.ADAPT.PREC
+    #     if prec == "amp":
+    #         with autocast():
+    #             output_x, _, _, _ = self.model(image_x) #[32,36] cls=12 [source+target+pseuo]
+    #             output_u, output_or, _, _ = self.model(image_u)
+
+    #             output_x_p=nn.Softmax(dim=1)(output_x)
+    #             output_u_p=nn.Softmax(dim=1)(output_u)
+
+    #             # domain_x_label = torch.zeros(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
+    #             # domain_u_label = torch.ones(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
+    #             # domain_u_label = torch.zeros(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
+    #             # domain_x_label = torch.ones(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
+
+    #             source_domain_token_x = torch.sum(output_x_p[:, :self.n_cls], dim=1)
+    #             #target_domain_token_x = torch.sum(output_x_p[:, self.n_cls:2 * self.n_cls], dim=1)
+    #             #domain_token_x = torch.stack((source_domain_token_x, target_domain_token_x), dim=1)
+    #             # domain_x_soft = torch.softmax(domain_token_x, dim=1)
+    #             # domain_loss_x = F.cross_entropy(domain_x_soft, domain_x_label)
+    #             domain_loss_x = -torch.mean(torch.log(source_domain_token_x + 1e-8))
+
+    #             #source_domain_token_u = torch.sum(output_u_p[:, :self.n_cls], dim=1)
+    #             target_domain_token_u = torch.sum(output_u_p[:, self.n_cls:2 * self.n_cls], dim=1)
+    #             #domain_token_u = torch.stack((source_domain_token_u, target_domain_token_u), dim=1)
+    #             # domain_u_soft = torch.softmax(domain_token_u, dim=1)
+    #             # domain_loss_u = F.cross_entropy(domain_u_soft, domain_u_label)
+    #             domain_loss_u = -torch.mean(torch.log(target_domain_token_u + 1e-8))
+
+
+
+            
+
+    #             #source CE LOSS
+    #             # output_x_soft = torch.softmax(output_x[:, :self.n_cls], dim=1)
+    #             # loss_x = F.cross_entropy(output_x_soft, label)
+    #             loss_x = F.cross_entropy(output_x[:, :self.n_cls], label)
+
+    #            # 1. 提取两个分支的预测 (CLIP分支 和 Target分支)
+    #             # 假设 output_u[:, -self.n_cls:] 是 CLIP 分支
+    #             # 假设 output_u[:, self.n_cls:2*self.n_cls] 是 Target 分支
+    #             with torch.no_grad():
+    #                 prob_clip = torch.softmax(output_or / self.cfg.TRAINER.ADAPT.T, dim=-1)
+    #                 prob_target = torch.softmax(output_u[:, self.n_cls:2*self.n_cls] / self.cfg.TRAINER.ADAPT.T, dim=-1)
+
+    #                 # 2. 准备非对称权重 omega (采样自指数分布)
+    #                 batch_size = prob_clip.size(0)
+    #                 # scale=0.1 是论文推荐值，倾向于信任 CLIP
+    #                 omega = np.random.exponential(scale=0.01, size=(batch_size, 1))
+    #                 omega = torch.from_numpy(omega).float().to(prob_clip.device)
+    #                 # 限制 omega 最大值为 1，防止溢出（虽然指数分布 scale=0.1 极少超过 1）
+    #                 omega = torch.clamp(omega, max=1.0)
+
+    #                 # 3. 执行非对称融合 (Asymmetric Fusion)
+    #                 # 按照 DIFO 公式: omega * Target + (1 - omega) * CLIP
+    #                 # 注意：如果想更信任 CLIP，公式应为 omega * Target + (1 - omega) * CLIP 且 omega 较小
+    #                 pseudo_label = omega * prob_target + (1 - omega) * prob_clip
+
+    #                 # 4. 后续处理 (计算 max_probs 和 mask)
+    #                 max_probs, label_p = torch.max(pseudo_label, dim=-1)
+    #                 mask = max_probs.ge(self.cfg.TRAINER.ADAPT.TAU).float()
+
+    #             #TARGET CE LOSS 
+    #             # output_u_soft =torch.softmax(output_u[:, self.n_cls:2 * self.n_cls], dim=1)
+    #             # loss_u = (F.cross_entropy(output_u_soft, label_p, reduction="none") * mask).sum() / mask.sum()
+    #             loss_u = (F.cross_entropy(output_u[:, self.n_cls:2 * self.n_cls], label_p, reduction="none") * mask).sum() / mask.sum()
+
+    #             #IM loss
+    #             softmax_out = nn.Softmax(dim=1)(output_u[:, self.n_cls:2 * self.n_cls])
+    #             entropy_loss = torch.mean(self.Entropy(softmax_out))  
+    #             msoftmax = softmax_out.mean(dim=0)
+    #             entropy_loss -= torch.sum(-msoftmax * torch.log(msoftmax + 1e-8))
+    #             im_loss = entropy_loss
+
+                
+    #             mask_l = max_probs > self.cfg.TRAINER.ADAPT.TAU # 论文中的 gamma 阈值
+    #             filtered_output_u_p = output_u_p[mask_l]
+    #             filtered_pseudo_labels = label_p[mask_l]
+
+
+    #             loss_c_dom = self.compute_L_dom_c(output_x_p, filtered_output_u_p, label, filtered_pseudo_labels, self.K)
+
+    #             loss = loss_x + self.cfg.TRAINER.ADAPT.U * loss_u + im_loss
+
+
+
+    #         self.optim.zero_grad()
+    #         self.scaler.scale(loss).backward()
+    #         self.scaler.step(self.optim)
+    #         self.scaler.update()
+    #         loss_summary = {
+    #             "loss": loss.item(),
+    #             "loss_x": loss_x.item(),
+    #             "loss_u": loss_u.item(),
+    #             "domain_loss_x": domain_loss_x,
+    #             "domain_loss_u": domain_loss_u,
+    #             "class_loss": loss_c_dom,
+    #             "acc_x": compute_accuracy(output_x[:, :self.n_cls], label)[0].item(),
+    #         }
+
+    #     self.update_lr()
+
+    #     return loss_summary
+
+    def forward_backward(self, batch_x, batch_u):
         image_x, label, image_u = self.parse_batch_train(batch_x, batch_u)
         prec = self.cfg.TRAINER.ADAPT.PREC
         if prec == "amp":
             with autocast():
-                output_x, _, _ = self.model(image_x) #[32,36] cls=12 [source+target+pseuo]
-                output_u, _, _ = self.model(image_u)
+                output_x, _, _, _ = self.model(image_x) #[32,36] cls=12 [source+target+pseuo]
+                output_u, output_u_or, _, _ = self.model(image_u)
 
-                output_x_p=nn.Softmax(dim=1)(output_x)
-                output_u_p=nn.Softmax(dim=1)(output_u)
+                #with torch.no_grad():
 
-                domain_x_label = torch.zeros(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
-                domain_u_label = torch.ones(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
-                # domain_u_label = torch.zeros(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
-                # domain_x_label = torch.ones(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
+                # output_x_p=nn.Softmax(dim=1)(output_x)
+                # output_u_p=nn.Softmax(dim=1)(output_u)
 
-                source_domain_token_x = torch.sum(output_x_p[:, :self.n_cls], dim=1)
-                target_domain_token_x = torch.sum(output_x_p[:, self.n_cls:2 * self.n_cls], dim=1)
-                domain_token_x = torch.stack((source_domain_token_x, target_domain_token_x), dim=1)
-                # domain_x_soft = torch.softmax(domain_token_x, dim=1)
-                # domain_loss_x = F.cross_entropy(domain_x_soft, domain_x_label)
-                domain_loss_x = F.cross_entropy(domain_token_x, domain_x_label)
+                # source_domain_token_x = torch.sum(output_x_p[:, :self.n_cls], dim=1)
+                # #target_domain_token_x = torch.sum(output_x_p[:, self.n_cls:2 * self.n_cls], dim=1)
+                # #domain_token_x = torch.stack((source_domain_token_x, target_domain_token_x), dim=1)
+                # # domain_x_soft = torch.softmax(domain_token_x, dim=1)
+                # # domain_loss_x = F.cross_entropy(domain_x_soft, domain_x_label)
+                # domain_loss_x = -torch.mean(torch.log(source_domain_token_x + 1e-8))
 
-                source_domain_token_u = torch.sum(output_u_p[:, :self.n_cls], dim=1)
-                target_domain_token_u = torch.sum(output_u_p[:, self.n_cls:2 * self.n_cls], dim=1)
-                domain_token_u = torch.stack((source_domain_token_u, target_domain_token_u), dim=1)
-                # domain_u_soft = torch.softmax(domain_token_u, dim=1)
-                # domain_loss_u = F.cross_entropy(domain_u_soft, domain_u_label)
-                domain_loss_u = F.cross_entropy(domain_token_u, domain_u_label)
+                # #source_domain_token_u = torch.sum(output_u_p[:, :self.n_cls], dim=1)
+                # target_domain_token_u = torch.sum(output_u_p[:, self.n_cls:2 * self.n_cls], dim=1)
+                # #domain_token_u = torch.stack((source_domain_token_u, target_domain_token_u), dim=1)
+                # # domain_u_soft = torch.softmax(domain_token_u, dim=1)
+                # # domain_loss_u = F.cross_entropy(domain_u_soft, domain_u_label)
+                # domain_loss_u = -torch.mean(torch.log(target_domain_token_u + 1e-8))
 
-                # only clip annotation
-                pseudo_label = torch.softmax(
-                    output_u[:, -self.n_cls:].reshape(-1, self.n_cls) /
-                    self.cfg.TRAINER.ADAPT.T,
-                    dim=-1)
+                with torch.no_grad():
 
-                max_probs, label_p = torch.max(pseudo_label, dim=-1)
-                mask = max_probs.ge(self.cfg.TRAINER.ADAPT.TAU).float()
+                    # 1. 将 Logits 分割为 Source 部分和 Target 部分
+                    logits_s = output_x[:, :self.n_cls]      # Source 类别的 logits
+
+                    # 2. 计算 LogSumExp (这就等价于 log(sum(exp(x))))
+                    # 这代表了 Source 域的总 log-energy 和 Target 域的总 log-energy
+                    lse_source = torch.logsumexp(logits_s, dim=1) 
+                    lse_all    = torch.logsumexp(output_x, dim=1) # 所有类别的 log-energy
+
+                    # 3. 计算 Log Probability
+                    # P(Source|x) = sum(exp(s_i)) / sum(exp(all))
+                    # log(P(Source|x)) = log(sum(exp(s_i))) - log(sum(exp(all))) = lse_source - lse_all
+                    log_prob_source = lse_source - lse_all
+
+                    # 4. 计算 Domain Loss (ADAPT 公式)
+                    # 对于源域样本 (label=0, 即属于 source)
+                    # 我们希望最大化 log_prob_source，即最小化 -log_prob_source
+                    domain_loss_x = -torch.mean(log_prob_source) 
+
+                    logits_t = output_u[:, self.n_cls:]      # Source 类别的 logits
+
+                    # 2. 计算 LogSumExp (这就等价于 log(sum(exp(x))))
+                    # 这代表了 Source 域的总 log-energy 和 Target 域的总 log-energy
+                    lse_target = torch.logsumexp(logits_t, dim=1)
+                    lse_all    = torch.logsumexp(output_u, dim=1) # 所有类别的 log-energy
+
+                    # 3. 计算 Log Probability
+                    # P(Source|x) = sum(exp(s_i)) / sum(exp(all))
+                    # log(P(Source|x)) = log(sum(exp(s_i))) - log(sum(exp(all))) = lse_source - lse_all
+                    log_prob_target = lse_target - lse_all
+
+                    # 4. 计算 Domain Loss (ADAPT 公式)
+                    # 对于源域样本 (label=0, 即属于 source)
+                    # 我们希望最大化 log_prob_source，即最小化 -log_prob_source
+                    domain_loss_u = -torch.mean(log_prob_target)     
+
+
+
+
+            
 
                 #source CE LOSS
                 # output_x_soft = torch.softmax(output_x[:, :self.n_cls], dim=1)
                 # loss_x = F.cross_entropy(output_x_soft, label)
                 loss_x = F.cross_entropy(output_x[:, :self.n_cls], label)
 
+               
+
+                with torch.no_grad():
+
+                    # # 1. 提取两个分支的预测 (CLIP分支 和 Target分支)
+                    # # 假设 output_u[:, -self.n_cls:] 是 CLIP 分支
+                    # # 假设 output_u[:, self.n_cls:2*self.n_cls] 是 Target 分支
+                    # prob_clip = torch.softmax(output_or / self.cfg.TRAINER.ADAPT.T, dim=-1)
+                    # prob_target = torch.softmax(output_u[:, self.n_cls:2*self.n_cls] / self.cfg.TRAINER.ADAPT.T, dim=-1)
+
+                    # # 2. 准备非对称权重 omega (采样自指数分布)
+                    # batch_size = prob_clip.size(0)
+                    # # scale=0.1 是论文推荐值，倾向于信任 CLIP
+                    # omega = np.random.exponential(scale=0.01, size=(batch_size, 1))
+                    # omega = torch.from_numpy(omega).float().to(prob_clip.device)
+                    # # 限制 omega 最大值为 1，防止溢出（虽然指数分布 scale=0.1 极少超过 1）
+                    # omega = torch.clamp(omega, max=1.0)
+
+                    # # 3. 执行非对称融合 (Asymmetric Fusion)
+                    # # 按照 DIFO 公式: omega * Target + (1 - omega) * CLIP
+                    # # 注意：如果想更信任 CLIP，公式应为 omega * Target + (1 - omega) * CLIP 且 omega 较小
+                    # pseudo_label = omega * prob_target + (1 - omega) * prob_clip
+
+                    pseudo_label = torch.softmax(
+                        output_u_or.reshape(-1, self.n_cls) /
+                        self.cfg.TRAINER.ADAPT.T,
+                        dim=-1)
+
+                    # 4. 后续处理 (计算 max_probs 和 mask)
+                    max_probs, label_p = torch.max(pseudo_label, dim=-1)
+                    mask = max_probs.ge(self.cfg.TRAINER.ADAPT.TAU).float()
+
                 #TARGET CE LOSS 
                 # output_u_soft =torch.softmax(output_u[:, self.n_cls:2 * self.n_cls], dim=1)
                 # loss_u = (F.cross_entropy(output_u_soft, label_p, reduction="none") * mask).sum() / mask.sum()
                 loss_u = (F.cross_entropy(output_u[:, self.n_cls:2 * self.n_cls], label_p, reduction="none") * mask).sum() / mask.sum()
-
-                # source_class = torch.randn(output_x.size(0)).to(torch.device("cuda"))
-                # target_class = torch.randn(output_x.size(0)).to(torch.device("cuda"))
-                # source_class_token = output_x[:, :self.n_cls]  # [32,12]
-                # target_class_token = output_x[:, self.n_cls:2 * self.n_cls]
-                # for i in range(output_x.size(0)):
-                #     source_class[i] = source_class_token[i, label[i]]
-                #     target_class[i] = target_class_token[i, label[i]]
-                # class_token = torch.stack((source_class, target_class), dim=1)
-                # #soft_class_token = torch.softmax(class_token, dim=1)
-                # class_loss_x = F.cross_entropy(class_token, domain_x_label)
-
-                # source_class_u = torch.randn(output_u.size(0)).to(torch.device("cuda"))
-                # target_class_u = torch.randn(output_u.size(0)).to(torch.device("cuda"))
-                # source_class_token_u = output_u[:, :self.n_cls]  # [32,12]
-                # target_class_token_u = output_u[:, self.n_cls:2 * self.n_cls]
-                # for i in range(output_u.size(0)):
-                #     source_class_u[i] = source_class_token_u[i, label_p[i]]
-                #     target_class_u[i] = target_class_token_u[i, label_p[i]]
-                # class_token_u = torch.stack((source_class_u, target_class_u), dim=1)
-                # #soft_class_token_u = torch.softmax(class_token_u, dim=1)
-                # class_loss_u = (F.cross_entropy(class_token_u, domain_u_label,
-                #                                   reduction="none") * mask).sum() / mask.sum()
-
-                mask_l = max_probs > self.cfg.TRAINER.ADAPT.TAU # 论文中的 gamma 阈值
-                filtered_output_u_p = output_u_p[mask_l]
-                filtered_pseudo_labels = label_p[mask_l]
-
-                loss_c_dom = self.compute_L_dom_c(output_x_p, filtered_output_u_p, label, filtered_pseudo_labels, self.K)
-
-
-
-
-                #lam = 2 / (1 + math.exp(-1 * 10 * self.epoch / self.max_epoch)) - 1
-
-                loss = loss_x + self.cfg.TRAINER.ADAPT.U * loss_u + (loss_c_dom + (domain_loss_x + domain_loss_u))
-
-            self.optim.zero_grad()
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optim)
-            self.scaler.update()
-
-        # loss_summary = {
-        #     "loss": loss.item(),
-        #     "loss_x": loss_x.item(),
-        #     "loss_u": loss_u.item(),
-        #     "class_loss_u": class_loss_u.item(),
-        #     "class_loss_x": class_loss_x.item(),
-        #     "domain_loss_x": domain_loss_x.item(),
-        #     "domain_loss_u": domain_loss_u.item(),
-        #     "acc_x": compute_accuracy(output_x[:, :self.n_cls], label)[0].item(),
-        # }
-
-        loss_summary = {
-            "loss": loss.item(),
-            "loss_x": loss_x.item(),
-            "loss_u": loss_u.item(),
-            "class_loss": loss_c_dom,
-            "domain_loss_x": domain_loss_x.item(),
-            "domain_loss_u": domain_loss_u.item(),
-            "acc_x": compute_accuracy(output_x[:, :self.n_cls], label)[0].item(),
-        }
-        self.update_lr()
-
-        return loss_summary
-
-    def Entropy(self, input_):
-        bs = input_.size(0)
-        epsilon = 1e-5
-        entropy = -input_ * torch.log(input_ + epsilon)
-        entropy = torch.sum(entropy, dim=1)
-        return entropy
-    
-
-    
-
-
-    def forward_backward_VPT(self, batch_x, batch_u):
-        image_x, label, image_u = self.parse_batch_train(batch_x, batch_u)
-        prec = self.cfg.TRAINER.ADAPT.PREC
-
-        if prec == "amp":
-            with autocast():
-                # train vision prompt
-                output_x, _, _ = self.model(image_x)
-                output_u, _, _ = self.model(image_u)
-
-                output_x_p=nn.Softmax(dim=1)(output_x)
-                output_u_p=nn.Softmax(dim=1)(output_u)
-
-                domain_x_label = torch.zeros(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
-                domain_u_label = torch.ones(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
-                # domain_u_label = torch.zeros(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
-                # domain_x_label = torch.ones(output_x.size(0), dtype=torch.long).to(torch.device("cuda"))
-
-                source_domain_token_x = torch.sum(output_x_p[:, :self.n_cls], dim=1)
-                target_domain_token_x = torch.sum(output_x_p[:, self.n_cls:2 * self.n_cls], dim=1)
-                domain_token_x = torch.stack((source_domain_token_x, target_domain_token_x), dim=1)
-                # domain_x_soft = torch.softmax(domain_token_x, dim=1)
-                # domain_loss_x = F.cross_entropy(domain_x_soft, domain_x_label)
-                domain_loss_x = F.cross_entropy(domain_token_x, domain_x_label)
-
-                source_domain_token_u = torch.sum(output_u_p[:, :self.n_cls], dim=1)
-                target_domain_token_u = torch.sum(output_u_p[:, self.n_cls:2 * self.n_cls], dim=1)
-                domain_token_u = torch.stack((source_domain_token_u, target_domain_token_u), dim=1)
-                # domain_u_soft = torch.softmax(domain_token_u, dim=1)
-                # domain_loss_u = F.cross_entropy(domain_u_soft, domain_u_label)
-                domain_loss_u = F.cross_entropy(domain_token_u, domain_u_label)
-
 
                 #IM loss
                 softmax_out = nn.Softmax(dim=1)(output_u[:, self.n_cls:2 * self.n_cls])
@@ -851,84 +855,43 @@ class ADAPT(TrainerXU):
                 entropy_loss -= torch.sum(-msoftmax * torch.log(msoftmax + 1e-5))
                 im_loss = entropy_loss
 
-                # source_class = torch.randn(output_x.size(0)).to(torch.device("cuda"))
-                # target_class = torch.randn(output_x.size(0)).to(torch.device("cuda"))
-                # source_class_token = output_x[:, :self.n_cls]  # [32,12]
-                # target_class_token = output_x[:, self.n_cls:2 * self.n_cls]
-                # for i in range(output_x.size(0)):
-                #     source_class[i] = source_class_token[i, label[i]]
-                #     target_class[i] = target_class_token[i, label[i]]
 
-                # class_token = torch.stack((source_class, target_class), dim=1)
-                # #soft_class_token = torch.softmax(class_token, dim=1)
-                # class_loss_x_G = F.cross_entropy(class_token, domain_x_label)
+                with torch.no_grad():
+                    output_x_p=nn.Softmax(dim=1)(output_x)
+                    output_u_p=nn.Softmax(dim=1)(output_u)
+                    loss_c_dom = self.compute_L_dom_c(output_x_p, output_u_p, label, label_p, self.n_cls)
+                
+                loss_align = self.compute_align_loss_soft(output_x, output_u, self.n_cls)
 
-                # only clip annotation
-                pseudo_label = torch.softmax(
-                    output_u[:, -self.n_cls:].reshape(-1, self.n_cls) /
-                    self.cfg.TRAINER.ADAPT.T,
-                    dim=-1)
-
-                max_probs, label_p = torch.max(pseudo_label, dim=-1)
-                mask = max_probs.ge(self.cfg.TRAINER.ADAPT.TAU).float()
-
-                # output_u_soft = torch.softmax(output_u[:, self.n_cls:2 * self.n_cls], dim=1)
-                # loss_u = (F.cross_entropy(output_u_soft, label_p, reduction="none") * mask).sum() / mask.sum()
-                loss_u = (F.cross_entropy(output_u[:, self.n_cls:2 * self.n_cls], label_p, reduction="none") * mask).sum() / mask.sum()
-
-                # source_class_u = torch.randn(32).to(torch.device("cuda"))
-                # target_class_u = torch.randn(32).to(torch.device("cuda"))
-                # source_class_token_u = output_u[:, :self.n_cls]  # [32,12]
-                # target_class_token_u = output_u[:, self.n_cls:2 * self.n_cls]
-                # for i in range(32):
-                #     source_class_u[i] = source_class_token_u[i, label_p[i]]
-                #     target_class_u[i] = target_class_token_u[i, label_p[i]]
-                # class_token_u = torch.stack((source_class_u, target_class_u), dim=1)
-                # #soft_class_token_u = torch.softmax(class_token_u, dim=1)
-                # class_loss_u_G = (F.cross_entropy(class_token_u, domain_u_label,
-                #                                 reduction="none") * mask).sum() / mask.sum()
-
-                # loss_mmd = self.mmd_loss_func(image_features_x, image_features_u)
-
-                mask_l = max_probs > self.cfg.TRAINER.ADAPT.TAU # 论文中的 gamma 阈值
-                filtered_output_u_p = output_u_p[mask_l]
-                filtered_pseudo_labels = label_p[mask_l]
+                loss = loss_x + self.cfg.TRAINER.ADAPT.U * loss_u + im_loss + loss_align * 0.1
 
 
-                loss_c_dom = self.compute_L_dom_c(output_x_p, filtered_output_u_p, label, filtered_pseudo_labels, self.K)
-
-
-                #lam = 2 / (1 + math.exp(-1 * 10 * self.epoch / self.max_epoch)) - 1
-                loss_G = self.cfg.TRAINER.ADAPT.U * loss_u + im_loss - (loss_c_dom + (domain_loss_x + domain_loss_u))
 
             self.optim.zero_grad()
-            self.scaler.scale(loss_G).backward()
+            self.scaler.scale(loss).backward()
             self.scaler.step(self.optim)
             self.scaler.update()
-        # loss_summary_G = {
-        #     "loss_G": loss_G.item(),
-        #     "im_loss": im_loss.item(),
-        #     "loss_u_G": loss_u.item(),
-        #     "domain_loss_x_G": domain_loss_x.item(),
-        #     "domain_loss_u_G": domain_loss_u.item(),
-        #     "class_loss_x_G": class_loss_x_G.item(),
-        #     "class_loss_u_G": class_loss_u_G.item(),
-        #     "acc_x": compute_accuracy(output_x[:, :self.n_cls], label)[0].item(),
-        # }
+            loss_summary = {
+                "loss": loss.item(),
+                "loss_x": loss_x.item(),
+                "loss_u": loss_u.item(),
+                "domain_loss_x": domain_loss_x,
+                "domain_loss_u": domain_loss_u,
+                "class_loss": loss_c_dom,
+                "acc_x": compute_accuracy(output_x[:, :self.n_cls], label)[0].item(),
+            }
 
-        loss_summary_G = {
-            "loss_G": loss_G.item(),
-            "im_loss": im_loss.item(),
-            "loss_u_G": loss_u.item(),
-            "domain_loss_x_G": domain_loss_x.item(),
-            "domain_loss_u_G": domain_loss_u.item(),
-            "class_loss_G": loss_c_dom,
-            "acc_x": compute_accuracy(output_x[:, :self.n_cls], label)[0].item(),
-        }
         self.update_lr()
 
-        return loss_summary_G
-
+        return loss_summary
+            
+    def Entropy(self, input_):
+        bs = input_.size(0)
+        epsilon = 1e-5
+        entropy = -input_ * torch.log(input_ + epsilon)
+        entropy = torch.sum(entropy, dim=1)
+        return entropy
+    
     def after_epoch(self):
         last_epoch = (self.epoch + 1) == self.max_epoch
         do_test = not self.cfg.TEST.NO_TEST
@@ -941,14 +904,17 @@ class ADAPT(TrainerXU):
             is_best = curr_result > self.best_result
             if is_best:
                 self.best_result = curr_result
-                self.save_model(self.epoch,
-                                self.output_dir,
-                                model_name="model-best.pth.tar")
+            #     self.save_model(self.epoch,
+            #                     self.output_dir,
+            #                     model_name="model-best.pth.tar")
+            
 
             self.set_model_mode("train")
 
-        if meet_checkpoint_freq or last_epoch:
-            self.save_model(self.epoch, self.output_dir)
+        # if meet_checkpoint_freq or last_epoch:
+        #     self.save_model(self.epoch, self.output_dir)
+        if last_epoch:
+            print("best result:",self.best_result,"%")
 
     def parse_batch_train(self, batch_x, batch_u):
         input = batch_x["img"]
@@ -1010,7 +976,7 @@ class ADAPT(TrainerXU):
             output = self.model_inference(input)[0].reshape(
                 -1, self.n_dm, self.n_cls)
             # the last second slice is the logits for target domain
-            output = output[:, -2, :]
+            output = output[:, -1, :]
             self.evaluator.process(output, label)
 
         results = self.evaluator.evaluate()

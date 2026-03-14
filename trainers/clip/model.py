@@ -226,10 +226,12 @@ class ResidualAttentionBlock_IVLP(nn.Module):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, input):
         # Will need to append the learnable tokens for this layer here
         # Check if flag was set for this layer or not
-        if self.add_prompt:
+        x = input[0]
+        use_vpt = input[1]
+        if self.add_prompt and use_vpt:
             # Also see if this is textual transformer layer or not
             if not self.text_layer:
                 # Remove the outputs produced by learnable tokens of previous layer
@@ -253,7 +255,7 @@ class ResidualAttentionBlock_IVLP(nn.Module):
 
         x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return [x, use_vpt]
 
 
 class ResidualAttentionBlock_MaPLe(nn.Module):
@@ -390,7 +392,7 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, use_vpt = True):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -401,17 +403,18 @@ class VisionTransformer(nn.Module):
 
         # After positional embeddings, we will attach prompts with the model, remember only those
         # are trainable parameters here in whole image encoder.
-        if self.VPT_shallow:
+        if self.VPT_shallow and use_vpt:
             visual_ctx = self.VPT.expand(x.shape[0], -1, -1).half()
             x = torch.cat([x, visual_ctx], dim=1)
-        else:
-            assert self.prompt_till_layer_visual == 0
+        # else:
+        #     assert self.prompt_till_layer_visual == 0
 
         # Normal code as before
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        outputs = self.transformer([x, use_vpt])
+        x = outputs[0]
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         x = self.ln_post(x[:, 0, :])
@@ -442,32 +445,31 @@ class VisionTransformer_MaPLe(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor, shared_ctx, compound_deeper_prompts):
-        x = self.conv1(x)  # shape = [*, width, grid, grid]
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        x = torch.cat(
-            [self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
-             x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+    def forward(self, x: torch.Tensor, shared_ctx=None, compound_deeper_prompts=None, use_vpt=True):
+        # 基础特征提取（这部分是共享的）
+        x = self.conv1(x)
+        x = x.reshape(x.shape[0], x.shape[1], -1)
+        x = x.permute(0, 2, 1)
+        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)
         x = x + self.positional_embedding.to(x.dtype)
 
-        # After positional embeddings, we will attach prompts with the model, remember only those
-        # are trainable parameters here in whole image encoder.
-        if self.VPT_shallow:
+        # --- 关键修改点：根据 use_vpt 开关决定是否注入 Prompt ---
+        if use_vpt and self.VPT_shallow and shared_ctx is not None:
             visual_ctx = shared_ctx.expand(x.shape[0], -1, -1).half()
             x = torch.cat([x, visual_ctx], dim=1)
-        else:
-            assert self.prompt_till_layer_visual == 0
-
-        # Normal code as before
+        
         x = self.ln_pre(x)
-
         x = x.permute(1, 0, 2)  # NLD -> LND
-        # Again combine the inputs, so nn.sequential can work
-        outputs = self.transformer([x, compound_deeper_prompts, 0])  # third argument is counter
+
+        deeper_prompts = compound_deeper_prompts if (use_vpt and compound_deeper_prompts is not None) else []
+    
+        # 这里的 list 结构要保持 [x, prompts, counter]
+        outputs = self.transformer([x, deeper_prompts, 0])
         x = outputs[0]
+        
         x = x.permute(1, 0, 2)  # LND -> NLD
 
+        # 无论有没有加 Prompt，Class Token 永远在 index 0 (由源码的 cat 决定)
         x = self.ln_post(x[:, 0, :])
 
         if self.proj is not None:

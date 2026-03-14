@@ -838,14 +838,17 @@ class ADAPT(TrainerXU):
             is_best = curr_result > self.best_result
             if is_best:
                 self.best_result = curr_result
-                self.save_model(self.epoch,
-                                self.output_dir,
-                                model_name="model-best.pth.tar")
+            #     self.save_model(self.epoch,
+            #                     self.output_dir,
+            #                     model_name="model-best.pth.tar")
+            
 
             self.set_model_mode("train")
 
-        if meet_checkpoint_freq or last_epoch:
-            self.save_model(self.epoch, self.output_dir)
+        # if meet_checkpoint_freq or last_epoch:
+        #     self.save_model(self.epoch, self.output_dir)
+        if last_epoch:
+            print("best result:",self.best_result,"%")
 
     def parse_batch_train(self, batch_x, batch_u):
         input = batch_x["img"]
